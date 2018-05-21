@@ -1,37 +1,46 @@
 #include "Arduino.h"
 #include "MPU9250.h"
-#include "BMP180.h"
+#include <Adafruit_BMP280.h>
 #include "math.h"
 #include "SD.h"
 
 #define SD_ERROR_LED PC13
 #define IMU_ERROR_LED PC14
 #define BMP_ERROR_LED PC15
-#define THRESHOLD 3
-#define THRESHOLD_DELAY 500
-
-//double T, P, p0, a;
-unsigned long timeStamp;
-
+#define LAUNCH_DETECTENCE_ACCELERATION_THRESHOLD 3
+#define LAUNCH_DETECTENCE_ACCELERATION_DURATION_MILLIS 500
 #define SD_BUFFER_SIZE 1024
-
-File flightData;
-MPU9250 imu;
-BMP180 pressure;
-
-String fileName;
-
-MPU9250_Data imuData;
-float currentAlt = 0;
-long timeStart = 0;
-
-
-double tempPressure = 0;
-bool isNewPressure = false;
-long launchMillis = 0;
 #define ALTITUDE_PRE_LAUNCH_BUFFER_SIZE 100
+
+MPU9250 imu;
+MPU9250_Data imuData;
+
+Adafruit_BMP280 pressure;
+File flightData;
+
+
+float startPressure = 0; //pressure when the rocket is initialized
+unsigned long systemTime; //millis for recording data
+float currentAlt = 0; //current altitude of the rocket
+long launchMillis = 0; //time at which the rocket launched
+
+
+
+
+// function prototype
+void addToPreLaunchAltitudeBuffer(float altitude);
+String getFileName();
+void writeData(String toWrite, bool force);
+bool initIMU();
+bool initBMP();
+void reportLaunch();
+void recordLaunch();
+float getAccelMagnitude();
+void waitForLaunchOverDuration();
+
 float altitudePreLaunchBuffer[ALTITUDE_PRE_LAUNCH_BUFFER_SIZE];
 int altitudePreLaunchBufferIndex = 0;
+
 void addToPreLaunchAltitudeBuffer(float altitude){
   altitudePreLaunchBuffer[altitudePreLaunchBufferIndex] = altitude;
   if(altitudePreLaunchBufferIndex + 1 < ALTITUDE_PRE_LAUNCH_BUFFER_SIZE) altitudePreLaunchBufferIndex ++;
@@ -39,33 +48,15 @@ void addToPreLaunchAltitudeBuffer(float altitude){
 }
 
 
-int SD_FAILURE =        0b00000001;
-int IMU_FAILURE =       0b00000010;
-int BMP_FAILURE =       0b00000100;
-int SD_NO_SPACE =       0b00001000;
-int LAUNCH_DETECTED =   0b00010000;
-
-int currentErrors = 0;
-
-void addError(int what){
-  currentErrors |= what;
-}
-
-void handleErrors(){
-  if(currentErrors &= (0b11111111 | SD_FAILURE)){
-    Serial.println("SD_FAILURE!");
-  }
-}
-
-void removeError(int what){
-  currentErrors &= what;
-}
 
 
+/*
+  getFileName()
 
+  returns the next available file name on the SD card following "fdat(number).txt"
 
-
-void recordLaunch();
+  @return String: file name that's available on the SD card, "" if non are avialble
+*/
 
 
 String getFileName(){
@@ -87,13 +78,10 @@ void writeData(String toWrite, bool force){
   if(buffIndex + toWrite.length() + 1 >= SD_BUFFER_SIZE || force){
     flightData.write(writeBuff,buffIndex);
     flightData.flush();
-    //Serial.println("Buff Size: " + String(buffIndex));
     for(int i = 0; i < buffIndex; i ++){
       writeBuff[i] = '\0';
     }
     buffIndex = 0;
-    //if(!force) writeData("Buffer wrote!\n", false);
-    //Serial.println("Writing buff!");
   }
   for(uint i = 0; i < toWrite.length(); i ++){
     writeBuff[buffIndex] = toWrite.charAt(i);
@@ -101,23 +89,35 @@ void writeData(String toWrite, bool force){
   }
 }
 
+
+/*
+  initIMU
+
+  Initializes and calibrates the IMU and returns false if the IMU fails
+
+  @return bool: A true or false dependent upon the success of the IMU initializing
+*/
+
 bool initIMU(){
   if(imu.begin(MPU9250_GYRO_RANGE_2000_DPS, MPU9250_ACCEL_RANGE_16_GPS) < 0){
-    //Serial.println("IMU init Fail!");
-    //digitalWrite(IMUFail, HIGH);
     return false;
   }
-  //Serial.println("IMU init Success!");
-  //Serial.println("Calibrating Gyroscope!");
   imu.calibrateGyroOffsets();
   imu.zero();
   imu.calibrateAccel();
   imu.setMagnetometerCalibrationOffsets(-36.35, 40.36, -140.07);
   imu.setMagnetometerCalibrationScales(1.0, 1.03, .92);
   imu.setDataFuseMode(MPU9250_DATA_FUSE_GYRO_MAG_AUTO_ACCEL);
-  //imu.calibrateMagnetometer();
   return true;
 }
+
+/*
+  initBMP
+
+  Initializes the BMP and returns false if the BMP fails
+
+  @return bool: A true or false dependent upon the success of the BMP initializing
+*/
 
 bool initBMP(){
   if (pressure.begin())
@@ -135,15 +135,21 @@ void reportLaunch(){
 
 void recordPreLaunchBuffer(){
   for(int i = 0; i < ALTITUDE_PRE_LAUNCH_BUFFER_SIZE; i ++){
-    writeData("@{PA:" + String(altitudePreLaunchBuffer[(altitudePreLaunchBufferIndex + i) % ALTITUDE_PRE_LAUNCH_BUFFER_SIZE]) + ";TS:" + String(timeStamp) + ";}@\n",false);
+    writeData("@{PA:" + String(altitudePreLaunchBuffer[(altitudePreLaunchBufferIndex + i) % ALTITUDE_PRE_LAUNCH_BUFFER_SIZE]) + ";TS:" + String(systemTime) + ";}@\n",false);
   }
 }
+
+/*
+  waitForLaunch
+
+  waits until a launch is detected by monitoring the acceleration of the rocket
+*/
 
 void waitForLaunch(){
   imu.getData(&imuData);
   float normalMag = sqrt(pow(imuData.accel.x,2) + pow(imuData.accel.y,2) + pow(imuData.accel.z,2));
   Serial.println("Accel: " + String(normalMag));
-  while(fabs(1.0 - normalMag) <= THRESHOLD){
+  while(fabs(1.0 - normalMag) <= LAUNCH_DETECTENCE_ACCELERATION_THRESHOLD){
     Serial.println("Accel: " + String(normalMag));
     imu.getData(&imuData);
     normalMag = sqrt(pow(imuData.accel.x,2) + pow(imuData.accel.y,2) + pow(imuData.accel.z,2));
@@ -152,9 +158,9 @@ void waitForLaunch(){
 }
 
 void setup() {
-    // put your setup code here, to run once:
     delay(5000);
     Serial.begin(115200);
+    Serial2.begin(9600);
     pinMode(IMU_ERROR_LED, OUTPUT);
     pinMode(BMP_ERROR_LED, OUTPUT);
     pinMode(SD_ERROR_LED, OUTPUT);
@@ -183,7 +189,7 @@ void setup() {
         delay(20);
       }
     }
-    fileName = getFileName();
+    String fileName = getFileName();
     if(fileName.equals("")){
       digitalWrite(SD_ERROR_LED, HIGH);
       digitalWrite(IMU_ERROR_LED, HIGH);
@@ -204,45 +210,73 @@ void setup() {
         delay(20);
       }
     }
-    timeStamp = millis();
+    startPressure = pressure.readPressure()/100.0;
+    systemTime = millis();
     recordLaunch();
 }
 
-//MPU9250_Raw_Data imuData;
+/*
+  sendDataThroughRadio
+
+  Sends the data through Serial2 which the radio is connected to on
+
+*/
+
+void sendDataThroughRadio(String what){
+  Serial2.println(what);
+}
+
+/*
+  recordLaunch
+
+  records flight data of the craft
+*/
 
 void recordLaunch(){
   waitForLaunch();
   launchMillis = millis();
   while(true){
-    timeStamp = millis() - launchMillis;
-    isNewPressure = pressure.getPressureAsync(&tempPressure);
-    //Serial.println("Pressure Delay: " + String(millis() - launchMillis - timeStamp));
-    if(isNewPressure){
-      currentAlt = pressure.altitude(tempPressure);
-      writeData("@{PA:" + String(currentAlt) + ";TS:" + String(timeStamp) + ";}@\n",false);
-    }
+    systemTime = millis() - launchMillis;
+    currentAlt = pressure.readAltitude(startPressure);
+    writeData("@{PA:" + String(currentAlt) + ";TS:" + String(systemTime) + ";}@\n",false);
+    sendDataThroughRadio("@{PA:" + String(currentAlt) + ";TS:" + String(systemTime) + ";}@\n");
     imu.getData(&imuData);
-    //flightData.println("High");
-    writeData("@{OX:" + String(imuData.orientation.x) + ";OY:" + String(imuData.orientation.y) + ";OZ:" + String(imuData.orientation.z) + ";TS:" + String(timeStamp) + ";}@\n",false);
+    writeData("@{OX:" + String(imuData.orientation.x) + ";OY:" + String(imuData.orientation.y) + ";OZ:" + String(imuData.orientation.z) + ";TS:" + String(systemTime) + ";}@\n",false);
+    writeData("@{AX:" + String(imuData.accel.x) + ";AY:" + String(imuData.accel.y) + ";AZ:" + String(imuData.accel.z) + ";TS:" + String(systemTime) + ";}@\n",false);
 
-    writeData("@{AX:" + String(imuData.accel.x) + ";AY:" + String(imuData.accel.y) + ";AZ:" + String(imuData.accel.z) + ";TS:" + String(timeStamp) + ";}@\n",false);
   }
 }
+
 void loop() {
 }
 
+
+/*
+  getAccelMagnitude
+
+  returns the total acceleration of the rocket
+
+  @return float: the total acceleration of the rocket
+*/
 
 float getAccelMagnitude(){
   imu.getData(&imuData);
   return sqrt(pow(imuData.accel.x,2) + pow(imuData.accel.y,2) + pow(imuData.accel.z,2));
 }
 
+/*
+  waitForLaunchOverDuration
+
+  Waits for a launch as defined as crossing an acceleration threshold and a time under acceleration
+
+*/
+
 void waitForLaunchOverDuration(){
   while(true){
-    while(fabs(1-getAccelMagnitude()) < THRESHOLD);
+    while(fabs(1-getAccelMagnitude()) < LAUNCH_DETECTENCE_ACCELERATION_THRESHOLD);
     long timeBegin = millis();
-    while(fabs(1-getAccelMagnitude()) >= THRESHOLD){
-      if (millis() - timeBegin > THRESHOLD_DELAY){
+    while(fabs(1-getAccelMagnitude()) >= LAUNCH_DETECTENCE_ACCELERATION_THRESHOLD){
+      if (millis() - timeBegin > LAUNCH_DETECTENCE_ACCELERATION_DURATION_MILLIS){
         return;
       }
     }
