@@ -558,11 +558,18 @@ void MPU9250::resetDevice(){
 
 
 bool MPU9250::checkMPU(){
-  if(mpuRead8(MPU9250_WHO_AM_I) != MPU9250_WHO_AM_I_RESPONSE){
+  while(mpuRead8(MPU9250_WHO_AM_I) != MPU9250_WHO_AM_I_RESPONSE){
     Serial.println(mpuRead8(MPU9250_WHO_AM_I),HEX);
+  }
+  Serial.println("Done!");
+  return true;
+  /*
+  if(mpuRead8(MPU9250_WHO_AM_I) != MPU9250_WHO_AM_I_RESPONSE){
+    while(true) Serial.println(mpuRead8(MPU9250_WHO_AM_I),HEX);
     return false;
   }
   return true;
+  */
 }
 
 void MPU9250::mpuWrite8(int reg, int value){

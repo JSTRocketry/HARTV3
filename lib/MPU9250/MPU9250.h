@@ -52,7 +52,7 @@
 #define MPU9250_FIFO_COUNTL 0x73
 #define MPU9250_FIFO_R_W 0x74
 #define MPU9250_WHO_AM_I 0x75
-#define MPU9250_WHO_AM_I_RESPONSE 0x71
+#define MPU9250_WHO_AM_I_RESPONSE 0x73
 
 #define AK8963_ADDR 0x0C
 #define AK8963_WHO_AM_I  0x00
@@ -218,7 +218,7 @@ private:
   int akValueL, akValueH;
   int i2cReadValue;
   void update();
-  void updateVelocityDistance(long elapsedTime); 
+  void updateVelocityDistance(long elapsedTime);
   void tiltCompensateMagnetometer(MPU9250_Scaled_Data *scaleData);
   void enableBypass();
   void getAllData(MPU9250_Raw_Data *rawData);
