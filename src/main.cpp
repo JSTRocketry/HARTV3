@@ -19,10 +19,6 @@
 
 
 //#define USE_GPS
-///
-
-
-kjl
 
 
 enum fixQuan{
