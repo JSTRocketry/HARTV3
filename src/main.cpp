@@ -4,17 +4,18 @@
 #include "math.h"
 #include "SD.h"
 
-#define SD_ERROR_LED PC14
-#define IMU_ERROR_LED PC15
+#define SD_ERROR_LED PC15
+#define IMU_ERROR_LED PA0
 #define BMP_ERROR_LED PB1
-#define RADIO_SET_PIN PC13
+#define RADIO_SET_PIN PA2
 #define LAUNCH_DETECTENCE_ACCELERATION_THRESHOLD 3
 #define LAUNCH_DETECTENCE_ACCELERATION_DURATION_MILLIS 500
 #define SD_BUFFER_SIZE 1024
 #define ALTITUDE_PRE_LAUNCH_BUFFER_SIZE 100
 #define SECOND_STAGE_IGNITION_DELAY 4000
-#define FIRST_STAGE_LAUNCH_PIN PC15
-#define SECOND_STAGE_LAUNCH_PIN PC15
+#define FIRST_STAGE_LAUNCH_PIN PC14
+#define SECOND_STAGE_LAUNCH_PIN PC13
+#define BUZZER_PIN PA1
 
 
 //#define USE_GPS
@@ -49,8 +50,21 @@ float startPressure = 0; //pressure when the rocket is initialized
 unsigned long systemTime; //millis for recording data
 float currentAlt = 0; //current altitude of the rocket
 long launchMillis = 0; //time at which the rocket launched
+unsigned long previousBuzzerTime = 0; //temp variable to hold previous buzzer time
+unsigned long buzzerHold = 500; //time for buzzer to be in limbo
+boolean OUTPUT_BUZZER = false; //part of boolean statement for buzzer duration
 GGA_GPS location;
-
+char writeBuff[SD_BUFFER_SIZE] = {};
+int buffIndex = 0;
+String radioBuffer;
+char tempRadioChar;
+int addon;
+int sumon;
+String currentBuffer;
+char temp;
+String gpsLine;
+long lastAltSend = 0;
+long altRadioDelay = 150;
 
 
 // function prototype
@@ -64,7 +78,6 @@ void recordLaunch();
 float getAccelMagnitude();
 void waitForLaunchOverDuration();
 void sendDataThroughRadio(String what);
-void writeToSD();
 float DMStoDecimal(float dms);
 int parseGPS(String line, GGA_GPS *gpsData);
 void updateGPS();
@@ -72,6 +85,9 @@ void initGPS();
 bool waitForRadioLaunch();
 void recordFlightData();
 bool getRadioLine(String *str);
+void turnOnBuzzer();
+void turnOffBuzzer();
+void updateBuzzer();
 
 struct altData{
   float altitude = 0;
@@ -96,7 +112,6 @@ void savePreLaunchBuffer(){
   }
 }
 
-
 /*
   getFileName()
 
@@ -104,7 +119,6 @@ void savePreLaunchBuffer(){
 
   @return String: file name that's available on the SD card, "" if non are avialble
 */
-
 
 String getFileName(){
   String base = "fdat";
@@ -118,22 +132,10 @@ String getFileName(){
   return "";
 }
 
-void writeToSD(){
-  while(true){
-      sendDataThroughRadio("@{PA:" + String(currentAlt) + ";TS:" + String(systemTime) + ";}@\n");
-      Serial.println("Sending Radio Alt");
-
-  writeData("@{PA:" + String(currentAlt) + ";TS:" + String(systemTime) + ";}@\n",false);
-  imu.getData(&imuData);
-  writeData("@{OX:" + String(imuData.orientation.x) + ";OY:" + String(imuData.orientation.y) + ";OZ:" + String(imuData.orientation.z) + ";TS:" + String(systemTime) + ";}@\n",false);
-  writeData("@{AX:" + String(imuData.accel.x) + ";AY:" + String(imuData.accel.y) + ";AZ:" + String(imuData.accel.z) + ";TS:" + String(systemTime) + ";}@\n",false);
-
-}
-}
-
-
-char writeBuff[SD_BUFFER_SIZE] = {};
-int buffIndex = 0;
+/*
+  writeData()
+  stores data in an array that then gets stored on the SD card because .write is slow
+*/
 
 void writeData(String toWrite, bool force){
   if(buffIndex + toWrite.length() + 1 >= SD_BUFFER_SIZE || force){
@@ -149,7 +151,6 @@ void writeData(String toWrite, bool force){
     buffIndex ++;
   }
 }
-
 
 /*
   initIMU
@@ -194,8 +195,6 @@ void reportLaunch(){
   digitalWrite(IMU_ERROR_LED, HIGH);
 }
 
-
-
 /*
   waitForLaunch
 
@@ -219,17 +218,22 @@ void waitForLaunch(){
   reportLaunch();
 }
 
+/*
+  gives power to the sirst stage launch pin
+*/
 void launchFirstStage(){
-  pinMode(FIRST_STAGE_LAUNCH_PIN, OUTPUT);
+  Serial.println("LAUNCHING FIRST STAGE!");
   digitalWrite(FIRST_STAGE_LAUNCH_PIN, HIGH);
-  long start = millis();
-  while(millis() - start < 1000){
-    recordFlightData();
-    delay(10);
-  }
+  //long start = millis();
+  //digitalWrite(FIRST_STAGE_LAUNCH_PIN, LOW);
 }
 
+/*
+  waits for first stage to complete its burn and verifies we have gained altitude
+*/
+
 bool waitForMECO(){
+  Serial.println("WAITING FOR FIRST STAGE CUTOFF");
   long start = millis();
   while(millis() - start < SECOND_STAGE_IGNITION_DELAY){
     recordFlightData();
@@ -241,8 +245,13 @@ bool waitForMECO(){
   return false;
 }
 
+/*
+  gives power to second stage launch oin and continues recording data
+*/
+
 void launchSecondStage(){
-  pinMode(SECOND_STAGE_LAUNCH_PIN, OUTPUT);
+  //pinMode(SECOND_STAGE_LAUNCH_PIN, OUTPUT);
+  Serial.println("LAUNCHING SECOND STAGE!");
   digitalWrite(SECOND_STAGE_LAUNCH_PIN, HIGH);
   long start = millis();
   while(millis() - start < 1000){
@@ -251,6 +260,9 @@ void launchSecondStage(){
   }
 }
 
+/*
+  Wiats for and echo message to ensure both radios are sinked together
+*/
 
 void syncRadio(){
   String msg = "";
@@ -265,16 +277,27 @@ void syncRadio(){
 
 }
 
+/*
+  initialize pins we use in program
+*/
+
 void initPins(){
   pinMode(RADIO_SET_PIN,OUTPUT);
   digitalWrite(RADIO_SET_PIN,HIGH);
   pinMode(IMU_ERROR_LED, OUTPUT);
   pinMode(BMP_ERROR_LED, OUTPUT);
   pinMode(SD_ERROR_LED, OUTPUT);
+  pinMode(BUZZER_PIN, OUTPUT);
+  pinMode(FIRST_STAGE_LAUNCH_PIN, OUTPUT);
+  pinMode(SECOND_STAGE_LAUNCH_PIN, OUTPUT);
   digitalWrite(IMU_ERROR_LED, LOW);
   digitalWrite(BMP_ERROR_LED,LOW);
   digitalWrite(SD_ERROR_LED, LOW);
 }
+
+/*
+  initialize all sensors
+*/
 
 void initSensors(){
   if(!initIMU()){
@@ -295,6 +318,10 @@ void initSensors(){
   Serial.println("BMP init Sucess");
 
 }
+
+/*
+  if file opening fails, alert user with an error light and halt program
+*/
 
 void openFlightDataFile(){
   if(!SD.begin(SPI_HALF_SPEED,PA4)){
@@ -331,11 +358,14 @@ void setup() {
     Serial.begin(115200);
     Serial2.begin(9600);
     Serial3.begin(4800);
-    initPins();
-    delay(3000);
-    Serial.println("Starting IMU");
-    initSensors();
-    //openFlightDataFile();
+    //initPins();
+    //turnOnBuzzer();
+    //delay(1000);
+    //turnOffBuzzer();
+    //delay(3000);
+    //Serial.println("Starting IMU");
+    //initSensors();
+    openFlightDataFile();
     #ifdef USE_GPS
       initGPS();
     #endif
@@ -350,7 +380,9 @@ void setup() {
     launchFirstStage();
     waitForMECO();
     launchSecondStage();
-
+    while(true){
+      recordFlightData();
+    }
     /*
     recordLaunch();
     long airTime = millis();
@@ -363,9 +395,9 @@ void setup() {
     */
 }
 
-
-String radioBuffer;
-char tempRadioChar;
+/*
+  returns completed line from radio or false if connection is unavaliable
+*/
 
 bool getRadioLine(String *str){
   if(Serial3.available()){
@@ -384,12 +416,40 @@ bool getRadioLine(String *str){
 }
 
 void turnOnBuzzer(){
-
+  digitalWrite(PA1, HIGH);
 }
 
 void turnOffBuzzer(){
-
+  digitalWrite(PA1, LOW);
 }
+
+/*
+  beeps buzzer so we can locate rocket after launch
+*/
+
+void updateBuzzer(){
+  unsigned long currentBuzzerTime = millis();
+  float differenceBuzzer = currentBuzzerTime - previousBuzzerTime;
+  if(OUTPUT_BUZZER){
+    turnOffBuzzer();
+    if(differenceBuzzer >= buzzerHold){
+      previousBuzzerTime = currentBuzzerTime;
+      OUTPUT_BUZZER = false;
+    }
+  }
+  else{
+    turnOnBuzzer();
+    if(differenceBuzzer >= buzzerHold){
+      previousBuzzerTime = currentBuzzerTime;
+      OUTPUT_BUZZER = true;
+    }
+  }
+}
+
+/*
+  listens for radio commands to arm, launch, or stan down. returns true is luanch is go
+  returns flase is we stand down
+*/
 
 bool waitForRadioLaunch(){
   bool hasRecievedOkay = false;
@@ -429,89 +489,40 @@ void sendDataThroughRadio(String what){
   Serial3.println(what);
 }
 
-long lastAltSend = 0;
-long altRadioDelay = 150;
+/*
+  records flight data and sends it over radio and stoires on SD card so we can view
+  info on our launch
+*/
+
 void recordFlightData(){
+  updateBuzzer();
   systemTime = millis() - launchMillis;
   currentAlt = pressure.readAltitude(startPressure);
-  updateGPS();
+  #ifdef USE_GPS
+    updateGPS();
+  #endif
   if((long)millis() - lastAltSend > altRadioDelay){
     sendDataThroughRadio("@{PA:" + String(currentAlt) + ";TS:" + String(systemTime) + ";}@\n");
     Serial.println("Sending Radio Alt");
     lastAltSend = millis();
-    initGPS();
-    sendDataThroughRadio("Latitude: " + String(location.latitude));
-    sendDataThroughRadio("Longitude: " + String(location.longitude));
+    #ifdef USE_GPS
+      initGPS();
+      sendDataThroughRadio("Latitude: " + String(location.latitude));
+      sendDataThroughRadio("Longitude: " + String(location.longitude));
+    #endif
   }
   writeData("@{PA:" + String(currentAlt) + ";TS:" + String(systemTime) + ";}@\n",false);
   imu.getData(&imuData);
   writeData("@{OX:" + String(imuData.orientation.x) + ";OY:" + String(imuData.orientation.y) + ";OZ:" + String(imuData.orientation.z) + ";TS:" + String(systemTime) + ";}@\n",false);
   writeData("@{AX:" + String(imuData.accel.x) + ";AY:" + String(imuData.accel.y) + ";AZ:" + String(imuData.accel.z) + ";TS:" + String(systemTime) + ";}@\n",false);
-  writeData("Timestamp: " + String(location.timeStamp), false);
-  writeData("Latitude: " + String(location.latitude), false);
-  writeData("Longitude: " + String(location.longitude), false);
+  //writeData("Timestamp: " + String(location.timeStamp), false);
+  //writeData("Latitude: " + String(location.latitude), false);
+  //writeData("Longitude: " + String(location.longitude), false);
   //Serial.println("Looping@");
-}
-
-/*
-  recordLaunch
-
-  records flight data of the craft
-*/
-
-void recordLaunch(){
-  String gpsLine;
-  GGA_GPS location;
-  waitForLaunch();
-  launchMillis = millis();
-  lastAltSend = millis();
-  while(true){
-    systemTime = millis() - launchMillis;
-    currentAlt = pressure.readAltitude(startPressure);
-    if((long)millis() - lastAltSend > altRadioDelay){
-      sendDataThroughRadio("@{PA:" + String(currentAlt) + ";TS:" + String(systemTime) + ";}@\n");
-      Serial.println("Sending Radio Alt");
-      lastAltSend = millis();
-      //initGPS();
-      #ifdef USE_GPS
-        sendDataThroughRadio("Latitude: " + String(location.latitude));
-        sendDataThroughRadio("Longitude: " + String(location.longitude));
-      #endif
-    }
-
-    writeData("@{PA:" + String(currentAlt) + ";TS:" + String(systemTime) + ";}@\n",false);
-    imu.getData(&imuData);
-    writeData("@{OX:" + String(imuData.orientation.x) + ";OY:" + String(imuData.orientation.y) + ";OZ:" + String(imuData.orientation.z) + ";TS:" + String(systemTime) + ";}@\n",false);
-    writeData("@{AX:" + String(imuData.accel.x) + ";AY:" + String(imuData.accel.y) + ";AZ:" + String(imuData.accel.z) + ";TS:" + String(systemTime) + ";}@\n",false);
-    //writeData("Timestamp: " + String(location.timeStamp), false);
-    #ifdef USE_GPS
-      updateGPS();
-      writeData("Latitude: " + String(location.latitude), false);
-      writeData("Longitude: " + String(location.longitude), false);
-    #endif
-    //Serial.println("Looping@");
-    if(Serial.available()){
-      char c = (char)Serial.read();
-      if(c == 'p'){
-        digitalWrite(PB0, LOW);
-      }
-      else if(c == 'n'){
-        digitalWrite(PB0,HIGH);
-      }
-      else{
-          Serial3.write(c);
-      }
-
-    }
-    if(Serial3.available()){
-      Serial.print((char)Serial3.read());
-    }
-  }
 }
 
 void loop() {
 }
-
 
 /*
   getAccelMagnitude
@@ -544,11 +555,6 @@ void waitForLaunchOverDuration(){
     }
   }
 }
-
-  int addon;
-  int sumon;
-
-
   /*
   DMStoDecimal()
 
@@ -566,8 +572,6 @@ void waitForLaunchOverDuration(){
     float decimal = degree + (minutes/60) + (secconds/3600);
     return decimal;
   }
-
-
   /*
   pareGPS()
 
@@ -639,8 +643,9 @@ void waitForLaunchOverDuration(){
 
   }
 
-  String currentBuffer;
-  char temp;
+  /*
+    gets line over radio. retrins false is radio connection is unavaliable
+  */
 
   bool getLine(String *str){
     if(Serial2.available()){
@@ -658,7 +663,10 @@ void waitForLaunchOverDuration(){
     return false;
   }
 
-  String gpsLine;
+  /*
+  looks for $GPGGA gps data and parses data if found
+  */
+
   void updateGPS(){
     if(getLine(&gpsLine)){
       //Serial.println("New GPS Data! " + gpsLine);
@@ -668,6 +676,10 @@ void waitForLaunchOverDuration(){
       }
     }
   }
+
+  /*
+    verifies GPS has connection. if no connection, continues updating gps
+  */
 
   void initGPS() {
       location.fixQuality = GPS_FIX_INVALID;
